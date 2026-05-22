@@ -1,0 +1,16 @@
+{
+  "name": "youtube-prospector",
+  "version": "1.0.0",
+  "description": "App para encontrar influenciadores do YouTube que precisam de editores de reels/vídeos",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.1.4",
+    "express": "^4.18.4"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
