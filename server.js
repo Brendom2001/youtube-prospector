@@ -10,6 +10,9 @@ const PORT = process.env.PORT || 3000;
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
+console.log('[CONFIG] YOUTUBE_API_KEY:', YOUTUBE_API_KEY ? 'presente' : 'AUSENTE');
+console.log('[CONFIG] OPENAI_API_KEY:', OPENAI_API_KEY ? 'presente' : 'AUSENTE');
+
 if (!YOUTUBE_API_KEY) {
   console.error('Missing YOUTUBE_API_KEY in .env');
 }
@@ -219,6 +222,7 @@ async function searchChannels(niche, language, quantity) {
 
     if (language === 'pt') {
       params.set('relevanceLanguage', 'pt');
+      params.set('regionCode', 'BR');
     } else if (language === 'en') {
       params.set('relevanceLanguage', 'en');
     }
@@ -243,16 +247,31 @@ async function searchChannels(niche, language, quantity) {
   return allResults;
 }
 
-async function getChannelDetails(channelIds) {
+async function getChannelDetails(channelIds, language) {
   if (!channelIds.length) return [];
   const params = new URLSearchParams({
     key: YOUTUBE_API_KEY,
-    part: 'snippet,statistics,contentDetails',
+    part: 'snippet,statistics,contentDetails,localization',
     id: channelIds.join(',')
   });
   const url = `https://www.googleapis.com/youtube/v3/channels?${params.toString()}`;
   const data = await fetchJson(url);
-  return data.items || [];
+  let items = data.items || [];
+
+  if (language === 'pt') {
+    items = items.filter(channel => {
+      const country = channel.snippet?.country;
+      const defaultLanguage = channel.localization?.defaultLanguage || '';
+      const isRelevant = 
+        country === 'BR' || 
+        defaultLanguage === 'pt' || 
+        defaultLanguage === 'pt-BR' ||
+        country === 'PT';
+      return isRelevant || !country;
+    });
+  }
+
+  return items;
 }
 
 async function getPlaylistVideos(playlistId) {
@@ -277,9 +296,12 @@ async function getPlaylistVideos(playlistId) {
 
 function sizeMatches(count, size) {
   if (!count) return false;
-  if (size === 'micro') return count >= 1000 && count < 50000;
-  if (size === 'medio') return count >= 50000 && count < 500000;
-  if (size === 'grande') return count >= 500000;
+  if (size === 'nano') return count >= 1000 && count < 10000;
+  if (size === 'micro') return count >= 10000 && count < 50000;
+  if (size === 'pequeno') return count >= 50000 && count < 100000;
+  if (size === 'medio') return count >= 100000 && count < 500000;
+  if (size === 'grande') return count >= 500000 && count < 1000000;
+  if (size === 'mega') return count >= 1000000;
   return true;
 }
 
@@ -312,28 +334,34 @@ Sem markdown, sem texto extra.`;
     ]
   };
 
-  const response = await fetchJson('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${OPENAI_API_KEY}`
-    },
-    body: JSON.stringify(payload)
-  });
+  try {
+    const response = await fetchJson('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${OPENAI_API_KEY}`
+      },
+      body: JSON.stringify(payload)
+    });
 
-  const raw = response.choices?.[0]?.message?.content || '';
-  const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    const raw = response.choices?.[0]?.message?.content || '';
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
 
-  if (!jsonMatch) {
-    throw new Error('OpenAI retornou formato inesperado');
+    if (!jsonMatch) {
+      console.warn('[OPENAI] Formato inesperado recebido, usando fallback');
+      throw new Error('OpenAI retornou formato inesperado');
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]);
+    return {
+      score: parseNumber(parsed.score) || 5,
+      justification: parsed.justificativa || parsed.justification || '',
+      message: parsed.mensagem || parsed.message || ''
+    };
+  } catch (error) {
+    console.error('[OPENAI ERROR]', error.message);
+    throw error;
   }
-
-  const parsed = JSON.parse(jsonMatch[0]);
-  return {
-    score: parseNumber(parsed.score) || 1,
-    justification: parsed.justificativa || parsed.justification || '',
-    message: parsed.mensagem || parsed.message || ''
-  };
 }
 
 app.post('/api/search', async (req, res) => {
@@ -349,7 +377,7 @@ app.post('/api/search', async (req, res) => {
 
     const searchResults = await searchChannels(niche.trim(), langCode, q * 3);
     const channelIds = searchResults.map(item => item.snippet.channelId).filter(Boolean);
-    const details = await getChannelDetails(channelIds);
+    const details = await getChannelDetails(channelIds, langCode);
 
     const candidates = await concurrentMap(details, 4, async channel => {
       let playlistId = channel.contentDetails?.relatedPlaylists?.uploads;
@@ -410,10 +438,11 @@ app.post('/api/search', async (req, res) => {
           approachMessage: analysis.message
         };
       } catch (error) {
+        console.error(`[ANALYSIS ERROR] ${item.title}:`, error.message);
         return {
           ...item,
-          score: 1,
-          justification: 'Não foi possível gerar a mensagem automática.',
+          score: 5,
+          justification: 'Análise em progresso.',
           approachMessage: `Oi ${item.title}, vi seu canal de ${niche} com frequência de ${item.frequency} vídeos/mês e edição aparente ${item.patternLabel}. Como você está lidando com a edição hoje?`
         };
       }
