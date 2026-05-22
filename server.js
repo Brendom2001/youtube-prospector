@@ -251,7 +251,7 @@ async function getChannelDetails(channelIds, language) {
   if (!channelIds.length) return [];
   const params = new URLSearchParams({
     key: YOUTUBE_API_KEY,
-    part: 'snippet,statistics,contentDetails,localization',
+    part: 'snippet,statistics,contentDetails',
     id: channelIds.join(',')
   });
   const url = `https://www.googleapis.com/youtube/v3/channels?${params.toString()}`;
@@ -261,12 +261,7 @@ async function getChannelDetails(channelIds, language) {
   if (language === 'pt') {
     items = items.filter(channel => {
       const country = channel.snippet?.country;
-      const defaultLanguage = channel.localization?.defaultLanguage || '';
-      const isRelevant = 
-        country === 'BR' || 
-        defaultLanguage === 'pt' || 
-        defaultLanguage === 'pt-BR' ||
-        country === 'PT';
+      const isRelevant = country === 'BR' || country === 'PT';
       return isRelevant || !country;
     });
   }
