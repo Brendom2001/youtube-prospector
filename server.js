@@ -139,6 +139,15 @@ function computeFrequencyAndConsistency(videos) {
   };
 }
 
+function getChannelAge(publishedAt) {
+  if (!publishedAt) return 0;
+  const now = Date.now();
+  const created = new Date(publishedAt).getTime();
+  if (Number.isNaN(created)) return 0;
+  const months = (now - created) / (1000 * 60 * 60 * 24 * 30);
+  return months;
+}
+
 function buildYouTubeUrl(channelId) {
   return `https://www.youtube.com/channel/${channelId}`;
 }
@@ -154,24 +163,84 @@ async function fetchJson(url, options = {}) {
   return response.json();
 }
 
-async function searchChannels(niche, language, quantity) {
-  const params = new URLSearchParams({
-    key: YOUTUBE_API_KEY,
-    part: 'snippet',
-    q: niche,
-    type: 'channel',
-    maxResults: `${quantity}`
-  });
+async function generateNicheVariations(niche) {
+  const prompt = `Gere 3 variações de keywords similares para o nicho: "${niche}"
+Retorne apenas um JSON com a chave "variations" contendo um array com 3 strings, sem numeração.
+Exemplo: {"variations": ["palavra1", "palavra2", "palavra3"]}`;
 
-  if (language === 'pt') {
-    params.set('relevanceLanguage', 'pt');
-  } else if (language === 'en') {
-    params.set('relevanceLanguage', 'en');
+  try {
+    const response = await fetchJson('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${OPENAI_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: 'gpt-5-mini',
+        temperature: 0.7,
+        max_tokens: 100,
+        messages: [
+          {
+            role: 'system',
+            content: 'Você é um especialista em análise de palavras-chave. Gere variações relevantes sem explicações extras.'
+          },
+          {
+            role: 'user',
+            content: prompt
+          }
+        ]
+      })
+    });
+
+    const raw = response.choices?.[0]?.message?.content || '';
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return [niche];
+    
+    const parsed = JSON.parse(jsonMatch[0]);
+    return [niche, ...(parsed.variations || [])].slice(0, 4);
+  } catch (error) {
+    return [niche];
+  }
+}
+
+async function searchChannels(niche, language, quantity) {
+  const variations = await generateNicheVariations(niche);
+  const allResults = [];
+  const seenIds = new Set();
+
+  for (const keyword of variations) {
+    const params = new URLSearchParams({
+      key: YOUTUBE_API_KEY,
+      part: 'snippet',
+      q: keyword,
+      type: 'channel',
+      maxResults: `${quantity * 2}`
+    });
+
+    if (language === 'pt') {
+      params.set('relevanceLanguage', 'pt');
+    } else if (language === 'en') {
+      params.set('relevanceLanguage', 'en');
+    }
+
+    try {
+      const url = `https://www.googleapis.com/youtube/v3/search?${params.toString()}`;
+      const data = await fetchJson(url);
+      const items = data.items || [];
+
+      for (const item of items) {
+        const channelId = item.snippet?.channelId;
+        if (channelId && !seenIds.has(channelId)) {
+          seenIds.add(channelId);
+          allResults.push(item);
+        }
+      }
+    } catch (error) {
+      console.warn(`Erro ao buscar variação "${keyword}":`, error.message);
+    }
   }
 
-  const url = `https://www.googleapis.com/youtube/v3/search?${params.toString()}`;
-  const data = await fetchJson(url);
-  return data.items || [];
+  return allResults;
 }
 
 async function getChannelDetails(channelIds) {
@@ -195,8 +264,15 @@ async function getPlaylistVideos(playlistId) {
     maxResults: '10'
   });
   const url = `https://www.googleapis.com/youtube/v3/playlistItems?${params.toString()}`;
-  const data = await fetchJson(url);
-  return data.items || [];
+  try {
+    const data = await fetchJson(url);
+    return data.items || [];
+  } catch (error) {
+    if (error.status === 404) {
+      return [];
+    }
+    throw error;
+  }
 }
 
 function sizeMatches(count, size) {
@@ -271,17 +347,24 @@ app.post('/api/search', async (req, res) => {
     const langCode = language === 'en' ? 'en' : 'pt';
     const sizeKey = ['micro', 'medio', 'grande'].includes(size) ? size : 'micro';
 
-    const searchResults = await searchChannels(niche.trim(), langCode, q);
+    const searchResults = await searchChannels(niche.trim(), langCode, q * 3);
     const channelIds = searchResults.map(item => item.snippet.channelId).filter(Boolean);
     const details = await getChannelDetails(channelIds);
 
     const candidates = await concurrentMap(details, 4, async channel => {
-      const playlistId = channel.contentDetails?.relatedPlaylists?.uploads;
+      let playlistId = channel.contentDetails?.relatedPlaylists?.uploads;
+      if (!playlistId && channel.id) {
+        playlistId = 'UU' + channel.id.substring(2);
+      }
       const videos = await getPlaylistVideos(playlistId);
       const analysis = computeFrequencyAndConsistency(videos);
 
       const subscribers = parseNumber(channel.statistics?.subscriberCount);
       const views = parseNumber(channel.statistics?.viewCount);
+      const videoCount = parseNumber(channel.statistics?.videoCount);
+      const publishedAt = channel.snippet?.publishedAt;
+      const channelAge = getChannelAge(publishedAt);
+
       const channelInfo = {
         id: channel.id,
         title: channel.snippet?.title || 'Canal sem nome',
@@ -289,6 +372,8 @@ app.post('/api/search', async (req, res) => {
         thumbnail: channel.snippet?.thumbnails?.high?.url || channel.snippet?.thumbnails?.default?.url || '',
         subscribers,
         views,
+        videoCount,
+        channelAge,
         country: channel.snippet?.country || 'N/A',
         ...analysis,
         channelUrl: buildYouTubeUrl(channel.id)
@@ -299,8 +384,21 @@ app.post('/api/search', async (req, res) => {
 
     const filtered = candidates
       .filter(item => item.frequency >= 2)
+      .filter(item => item.videoCount >= 10)
+      .filter(item => item.channelAge >= 6)
       .filter(item => ['EDIÇÃO SIMPLES', 'INCONSISTENTE', 'VOLUME ALTO'].includes(item.badge))
-      .filter(item => sizeMatches(item.subscribers, sizeKey));
+      .filter(item => sizeMatches(item.subscribers, sizeKey))
+      .slice(0, q);
+
+    if (filtered.length === 0 && candidates.length > 0) {
+      const fallback = candidates
+        .filter(item => item.videoCount >= 5)
+        .filter(item => ['EDIÇÃO SIMPLES', 'INCONSISTENTE', 'VOLUME ALTO'].includes(item.badge))
+        .slice(0, q);
+      if (fallback.length > 0) {
+        filtered.push(...fallback);
+      }
+    }
 
     const qualified = await concurrentMap(filtered, 3, async item => {
       try {
